@@ -1,0 +1,10 @@
+{
+  "appKey": "请填写你的有道应用 ID",
+  "appSecret": "请填写你的有道应用密钥",
+  "from": "zh-CHS",
+  "to": "en",
+  "endpoint": "https://openapi.youdao.com/api",
+  "requestIntervalMs": 600,
+  "maxRetries": 4,
+  "retryBaseDelayMs": 1000
+}

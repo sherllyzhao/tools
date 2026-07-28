@@ -1,0 +1,7 @@
+{
+  "appKey": "12d8872ef4305999",
+  "appSecret": "CuKHoums5mVUlOTNjJNxbODyzzqz49yT",
+  "from": "zh-CHS",
+  "to": "en",
+  "endpoint": "https://openapi.youdao.com/api"
+}
