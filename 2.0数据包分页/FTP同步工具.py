@@ -9,8 +9,16 @@ import os
 import sys
 import shutil
 import math
+import io
+import zipfile
+import struct
+import urllib.request
+import urllib.error
 from datetime import datetime
 from ftplib import FTP
+
+# 建站通导出接口：返回 jsonDatas.zip，比 FTP 更快拿到最新数据
+DEFAULT_API_BASE_URL = "https://jzt2.china9.cn/api/Download/index"
 
 # --- 编码兜底：确保在 Windows GBK 控制台/重定向下也能输出 emoji 与中文，不崩溃 ---
 if os.name == "nt":
@@ -387,6 +395,138 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
                         pass
 
     @staticmethod
+    def truncate_to_zip(data):
+        """截掉 ZIP 之后的附加内容。
+
+        建站通接口开着 ThinkPHP 调试模式，会把几十 KB 的 trace 面板 HTML
+        直接拼在 zip 二进制后面。按 EOCD（中央目录结束记录）定位真实结尾，
+        否则 zipfile 会因尾部垃圾数据报错或警告。
+        """
+        if not data.startswith(b"PK"):
+            return data
+        end = data.rfind(b"PK\x05\x06")
+        if end == -1 or end + 22 > len(data):
+            return data
+        try:
+            comment_len = struct.unpack("<H", data[end + 20 : end + 22])[0]
+        except struct.error:
+            return data
+        return data[: end + 22 + comment_len]
+
+    @staticmethod
+    def download_api_zip(config):
+        """从建站通接口下载 jsonDatas.zip，返回 zipfile.ZipFile。
+
+        失败时打印原因并返回 None，让调用方决定降级还是中止。
+        """
+        site_id = (config.get("site_id") or "").strip()
+        if not site_id:
+            print("[错误] 未设置 site_id，无法从接口下载")
+            print("       请到 配置管理 → 运行模式 里填写")
+            return None
+
+        base = (config.get("api_base_url") or DEFAULT_API_BASE_URL).strip()
+        sep = "&" if "?" in base else "?"
+        url = f"{base}{sep}site_id={site_id}"
+
+        try:
+            print(f"\n[接口] 下载 {base} (site_id={site_id}) ...")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            print(f"[错误] 接口返回 HTTP {e.code}")
+            return None
+        except Exception as e:
+            print(f"[错误] 接口请求失败: {e}")
+            return None
+
+        if not raw:
+            print("[错误] 接口返回空内容")
+            return None
+
+        data = FTPToolkit.truncate_to_zip(raw)
+        if len(data) != len(raw):
+            print(f"[接口] 收到 {len(raw)} 字节，剥离尾部调试内容后 {len(data)} 字节")
+        else:
+            print(f"[接口] 收到 {len(raw)} 字节")
+
+        if not data.startswith(b"PK"):
+            # 多半是网关错误页或鉴权失败页，给出可读的前几行帮助排查
+            head = raw[:200].decode("utf-8", "replace").replace("\n", " ")
+            print(f"[错误] 返回的不是 zip 文件，开头内容: {head}")
+            return None
+
+        try:
+            return zipfile.ZipFile(io.BytesIO(data))
+        except Exception as e:
+            print(f"[错误] zip 解析失败: {e}")
+            return None
+
+    @staticmethod
+    def list_zip_json_files(zf):
+        """列出 zip 里「一级」的 json 文件名（不含子目录、不含工具产物）。
+
+        接口的包结构是 jsonDatas/xxx.json，另有 content/、goods/ 等子目录
+        存详情页数据。分页只针对一级列表文件，子目录一律忽略。
+        """
+        names = []
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            path = info.filename.replace("\\", "/")
+            parts = [p for p in path.split("/") if p]
+            if not parts:
+                continue
+            # 去掉最外层 jsonDatas/ 目录后，剩余层级 >1 说明在子目录里
+            if parts[0].lower() == "jsondatas":
+                parts = parts[1:]
+            if len(parts) != 1:
+                continue
+            name = parts[0]
+            if not name.lower().endswith(".json"):
+                continue
+            if FTPToolkit.is_generated_json(name):
+                continue
+            names.append(name)
+        return sorted(set(names))
+
+    @staticmethod
+    def read_zip_json(zf, filename):
+        """从 zip 里按文件名取内容，兼容有无 jsonDatas/ 前缀两种写法。
+
+        返回 bytes；找不到返回 None。
+        """
+        target = filename.replace("\\", "/").strip("/").lower()
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            path = info.filename.replace("\\", "/").strip("/")
+            low = path.lower()
+            if low == target or low.endswith("/" + target):
+                return zf.read(info.filename)
+        return None
+
+    @staticmethod
+    def fetch_api_json_files(config):
+        """列出接口 zip 里可分页的 json 文件名。
+
+        与 fetch_remote_json_files 同契约：成功返回列表，失败返回 None。
+        """
+        zf = FTPToolkit.download_api_zip(config)
+        if zf is None:
+            return None
+        try:
+            files = FTPToolkit.list_zip_json_files(zf)
+            print(f"[接口] 找到 {len(files)} 个可分页的 json 文件")
+            return files
+        finally:
+            try:
+                zf.close()
+            except Exception:
+                pass
+
+    @staticmethod
     def fetch_local_json_files(config):
         """列出本地基础目录下「一级」的 .json 文件名。
 
@@ -432,9 +572,17 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         if not isinstance(config.get("page_size"), int) or config["page_size"] <= 0:
             config["page_size"] = 20
 
-        # 数据源：ftp = 从服务器下载最新的；local = 直接用本地已有的
-        if config.get("source_mode") not in ("ftp", "local"):
+        # 数据源：http = 接口下载 zip（推荐，最快拿到最新）
+        #        ftp  = 从 FTP 下载（可能滞后）
+        #        local = 直接用本地已有的
+        if config.get("source_mode") not in ("ftp", "local", "http"):
             config["source_mode"] = "ftp"
+
+        # 接口下载相关：站点 id 由用户填写，接口地址一般不用改
+        if not config.get("api_base_url"):
+            config["api_base_url"] = DEFAULT_API_BASE_URL
+        if "site_id" not in config:
+            config["site_id"] = ""
 
         # 分页完是否回传服务器；关掉就是「只分页，产物留本地」
         if not isinstance(config.get("upload_after_paginate"), bool):
@@ -488,12 +636,13 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         """交互式选择需要分页的文件。
 
         默认单文件（content.json）；用户确认需要多文件时，才按当前数据源
-        （FTP 远程 / 本地目录）拉取一级 json 列表供勾选。
+        （接口/FTP 远程 / 本地目录）拉取一级 json 列表供勾选。
         返回文件名列表；用户取消时返回 None（调用方保持原值不变）。
         """
         current = current or ["content.json"]
-        from_ftp = config.get("source_mode", "ftp") == "ftp"
-        where = "远程" if from_ftp else "本地"
+        mode = config.get("source_mode", "ftp")
+        where_map = {"http": "接口", "ftp": "远程", "local": "本地"}
+        where = where_map.get(mode, "未知源")
 
         print("\n" + "=" * 70)
         print("分页文件设置".center(70))
@@ -505,11 +654,12 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
             print("  → 使用默认: content.json")
             return ["content.json"]
 
-        available = (
-            self.fetch_remote_json_files(config)
-            if from_ftp
-            else self.fetch_local_json_files(config)
-        )
+        if mode == "http":
+            available = FTPToolkit.fetch_api_json_files(config)
+        elif mode == "ftp":
+            available = self.fetch_remote_json_files(config)
+        else:
+            available = self.fetch_local_json_files(config)
 
         if available is None:
             # 读不到就降级为纯手输，不阻断配置流程
@@ -518,7 +668,7 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
             return self.parse_paginate_files(manual) if manual else None
 
         if not available:
-            print(f"\n⚠️  {where}目录下没有找到可分页的 json 文件")
+            print(f"\n⚠️  {where}没有找到可分页的 json 文件")
             manual = input("手动输入文件名 (逗号分隔，回车取消): ").strip()
             return self.parse_paginate_files(manual) if manual else None
 
@@ -717,10 +867,15 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
     @staticmethod
     def describe_flow(config):
         """把运行模式翻译成一句人话，菜单/同步入口共用。"""
-        from_ftp = config.get("source_mode", "ftp") == "ftp"
+        mode = config.get("source_mode", "ftp")
         do_upload = config.get("upload_after_paginate", True)
+        source_desc = {
+            "http": "接口下载",
+            "ftp": "FTP 下载",
+            "local": "本地文件",
+        }.get(mode, "未知源")
         return (
-            f"{'FTP 下载' if from_ftp else '本地文件'} → 分页"
+            f"{source_desc} → 分页"
             f"{' → 上传' if do_upload else '（不上传，产物留本地）'}"
         )
 
@@ -734,9 +889,11 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         labels = {
             "source_mode": "数据源",
             "upload_after_paginate": "分页后上传",
+            "site_id": "接口 site_id",
+            "api_base_url": "接口地址",
         }
         readable = {
-            "source_mode": {"ftp": "FTP 下载", "local": "本地文件"},
+            "source_mode": {"http": "接口下载", "ftp": "FTP 下载", "local": "本地文件"},
             "upload_after_paginate": {True: "是", False: "否"},
         }
 
@@ -747,6 +904,15 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         for key, value in config.items():
             if key == "ftp_pass":
                 print(f"  {key}: {value[:3]}{'*' * (len(value) - 3)}")
+            elif key == "site_id":
+                # http 模式时才显示 site_id
+                if config.get("source_mode") == "http":
+                    display = value if value else "(未设置)"
+                    print(f"  {labels.get(key, key)}: {display}")
+            elif key == "api_base_url":
+                # http 模式时才显示接口地址
+                if config.get("source_mode") == "http":
+                    print(f"  {labels.get(key, key)}: {value}")
             elif key in readable:
                 shown = readable[key].get(value, value)
                 print(f"  {labels[key]}: {shown}")
@@ -771,7 +937,8 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         print("\n数据源：")
         print("  1. FTP 下载（每次同步前拉最新的）")
         print("  2. 本地文件（直接用 local_base_dir 里已有的）")
-        src = input(f"请选择 (回车保持 {'1' if config.get('source_mode', 'ftp') == 'ftp' else '2'}): ").strip()
+        print("  3. 接口下载（最快拿最新数据，推荐）")
+        src = input(f"请选择 (回车保持 {'1' if config.get('source_mode', 'ftp') == 'ftp' else ('2' if config.get('source_mode') == 'local' else '3')}): ").strip()
 
         changed = False
         if src == "1":
@@ -780,6 +947,18 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         elif src == "2":
             changed = config.get("source_mode") != "local"
             config["source_mode"] = "local"
+        elif src == "3":
+            changed = config.get("source_mode") != "http"
+            config["source_mode"] = "http"
+            # 如果选了接口，需要填 site_id
+            if config.get("source_mode") == "http":
+                current_id = (config.get("site_id") or "").strip()
+                site_id = input(f"\n请输入 site_id (当前: {current_id or '未设置'}): ").strip()
+                if site_id:
+                    config["site_id"] = site_id
+                    changed = True
+                elif not current_id:
+                    print("  ⚠️  未设置 site_id，接口无法使用")
 
         print("\n分页完是否上传到服务器？")
         print("  1. 上传（完整同步）")
@@ -800,6 +979,9 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         print(f"\n新的流程: {self.describe_flow(config)}")
         if config["source_mode"] == "local":
             print(f"本地源目录: {config.get('local_base_dir', '(未设置)')}")
+        elif config["source_mode"] == "http":
+            print(f"接口地址: {config.get('api_base_url', DEFAULT_API_BASE_URL)}")
+            print(f"site_id: {config.get('site_id', '(未设置)')}")
 
         if self.save_config(config_name, config):
             print("\n✅ 运行模式已保存")
@@ -1139,30 +1321,42 @@ class FTPSync:
     def run(self):
         """主工作流：对配置里的每个文件依次「取源→分页→(可选)上传」。
 
-        源可以是 FTP 下载或本地已有文件；上传可关闭。
-        两者都不需要 FTP 时（本地源 + 不上传）全程不建立连接。
+        源可以是 http(接口)/ftp/本地 三种；上传可关闭。
+        http 源一次性拉 ZIP 到内存，循环里逐个文件提取。
         """
         files = self.config.get("paginate_files") or ["content.json"]
         upload_base = self.config["ftp_upload_path"].rstrip("/")
         local_base = self.config["local_base_dir"]
-        from_ftp = self.config.get("source_mode", "ftp") == "ftp"
+        source_mode = self.config.get("source_mode", "ftp")
         do_upload = self.config.get("upload_after_paginate", True)
 
+        from_http = source_mode == "http"
+        from_ftp = source_mode == "ftp"
+
         title = "开始同步" if do_upload else "开始分页（不上传）"
-        flow = (
-            f"{'FTP 下载' if from_ftp else '本地文件'} → 分页"
-            f"{' → 上传' if do_upload else '（产物留在本地）'}"
-        )
+        flow_desc = {
+            "http": f"接口下载 → 分页{' → 上传' if do_upload else '（产物留在本地）'}",
+            "ftp": f"FTP 下载 → 分页{' → 上传' if do_upload else '（产物留在本地）'}",
+            "local": f"本地文件 → 分页{' → 上传' if do_upload else '（产物留在本地）'}",
+        }
+        flow = flow_desc.get(source_mode, "未知源 → 分页")
 
         print("\n" + "=" * 70)
         print(title.center(70))
         print("=" * 70)
         print(f"\n流程: {flow}")
         print(f"待处理文件 ({len(files)} 个): {', '.join(files)}")
-        if not from_ftp:
+
+        # 接口源：开跑前一次性拉 ZIP
+        http_zip = None
+        if from_http:
+            http_zip = FTPToolkit.download_api_zip(self.config)
+            if http_zip is None:
+                return False
+        elif source_mode == "local":
             print(f"本地源目录: {local_base}")
 
-        # 只有真正需要时才连 FTP
+        # 只有真正需要时才连 FTP（上传或 FTP 源）
         if (from_ftp or do_upload) and not self.connect_ftp():
             return False
 
@@ -1175,8 +1369,24 @@ class FTPSync:
             print(f"[{idx}/{len(files)}] 处理 {filename}")
             print("-" * 70)
 
-            # 取源：FTP 下到临时文件，或直接用本地已有文件
-            if from_ftp:
+            # 取源：http 从 ZIP、ftp 下载、或本地直读
+            if from_http:
+                source_file = os.path.join(local_base, f".temp_{stem}.json")
+                is_temp = True
+                data = FTPToolkit.read_zip_json(http_zip, filename)
+                if data is None:
+                    print(f"[错误] ZIP 里找不到 {filename}")
+                    failed.append((filename, "ZIP 里缺失"))
+                    continue
+                try:
+                    with open(source_file, "wb") as f:
+                        f.write(data)
+                    print(f"[接口] 已解压 {filename}")
+                except Exception as e:
+                    print(f"[错误] 写临时文件失败: {e}")
+                    failed.append((filename, "写文件失败"))
+                    continue
+            elif from_ftp:
                 source_file = os.path.join(local_base, f".temp_{stem}.json")
                 is_temp = True
                 if not self.download_file(f"{upload_base}/{filename}", source_file):
