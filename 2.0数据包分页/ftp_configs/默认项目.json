@@ -1,0 +1,11 @@
+{
+  "ftp_host": "222.171.249.195",
+  "ftp_user": "hrbls_org",
+  "ftp_pass": "X7FEzMhJbSPh4jZJ",
+  "ftp_source_path": "/jsonDatas/content.json",
+  "ftp_upload_path": "/jsonDatas",
+  "local_base_dir": "E:\\项目\\建站通\\市律协\\jsonDatas",
+  "page_size": 20
+}
+
+

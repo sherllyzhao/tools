@@ -1,0 +1,17 @@
+{
+  "ftp_host": "vpn.zihai.cn",
+  "ftp_user": "p8GX5Po3",
+  "ftp_pass": "FDNmNDy8bQ@aA3",
+  "ftp_port": 20195,
+  "ftp_upload_path": "/jsonDatas",
+  "local_base_dir": "E:\\项目\\建站通\\凯瑞",
+  "page_size": 20,
+  "paginate_files": [
+    "content.json",
+    "goods.json"
+  ],
+  "source_mode": "http",
+  "site_id": "6a5d900c3b7c8a0bdb25998e",
+  "api_base_url": "https://jzt2.china9.cn/api/Download/index",
+  "upload_after_paginate": false
+}

@@ -7,6 +7,7 @@ FTP 内容同步工具 - 一体化版本
 import json
 import os
 import sys
+import re
 import shutil
 import math
 import io
@@ -277,11 +278,11 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
 
     @staticmethod
     def parse_ftp_block(lines):
-        """解析 FlashFXP 粘贴的多行文本，返回 {host, user, pass}。
+        """解析 FlashFXP 粘贴的多行文本，返回 {host, user, pass, port}。
 
-        兼容全角/半角冒号，行标签含「地址/账户/用户/密码」等关键字即可。
+        兼容全角/半角冒号，行标签含「地址/账户/用户/密码/端口」等关键字即可。
         """
-        result = {"ftp_host": "", "ftp_user": "", "ftp_pass": ""}
+        result = {"ftp_host": "", "ftp_user": "", "ftp_pass": "", "ftp_port": 21}
         for raw in lines:
             line = raw.strip()
             if not line:
@@ -303,6 +304,13 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
                 result["ftp_user"] = value
             elif "密码" in label or "pass" in label.lower():
                 result["ftp_pass"] = value
+            elif "端口" in label or "port" in label.lower():
+                # 值里可能混着其他字符，只取数字部分
+                digits = re.findall(r"\d+", value)
+                if digits:
+                    port_num = int(digits[0])
+                    if 1 <= port_num <= 65535:
+                        result["ftp_port"] = port_num
         return result
 
     @staticmethod
@@ -344,6 +352,46 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         )
 
     @staticmethod
+    def resolve_remote_dir(ftp, configured_path):
+        """把配置里的上传目录解析成该服务器上真正能用的绝对路径。
+
+        不同 FTP 服务器的登录落点不一样：
+          - 落在根目录的（如律协/粮食站），/jsonDatas 直接可用；
+          - 每个账户隔离到自己家目录的（如凯瑞站，登录后 pwd 是 /p8GX5Po3），
+            /jsonDatas 在根下并不存在，真实路径是 /p8GX5Po3/jsonDatas。
+
+        所以先按配置值原样试，失败再退回「家目录 + 相对路径」。返回可用的
+        绝对路径；两种都进不去时抛出最后一个异常，由调用方决定怎么报错。
+        """
+        configured = (configured_path or "/jsonDatas").rstrip("/") or "/"
+        try:
+            home = ftp.pwd()
+        except Exception:
+            home = "/"
+
+        candidates = [configured]
+        rel = configured.lstrip("/")
+        if rel:
+            joined = home.rstrip("/") + "/" + rel
+            if joined not in candidates:
+                candidates.append(joined)
+            if rel not in candidates:
+                candidates.append(rel)
+
+        last_error = None
+        for path in candidates:
+            try:
+                ftp.cwd(path)
+                actual = ftp.pwd()
+                if path != configured:
+                    print(f"[FTP] 上传目录已按家目录校正: {configured} → {actual}")
+                return actual
+            except Exception as e:
+                last_error = e
+
+        raise last_error or Exception(f"无法进入远程目录: {configured}")
+
+    @staticmethod
     def fetch_remote_json_files(config):
         """列出远程上传目录下「一级」的 .json 文件名。
 
@@ -353,13 +401,15 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         返回文件名列表；连接或列目录失败返回 None，便于调用方降级为手输。
         """
         remote_dir = (config.get("ftp_upload_path") or "/jsonDatas").rstrip("/") or "/"
+        ftp_port = config.get("ftp_port", 21)
         ftp = None
         try:
-            print(f"\n[FTP] 连接 {config['ftp_host']} 读取 {remote_dir} ...")
-            ftp = FTP(config["ftp_host"], timeout=30)
+            print(f"\n[FTP] 连接 {config['ftp_host']}:{ftp_port} 读取 {remote_dir} ...")
+            ftp = FTP(timeout=30)
+            ftp.connect(config["ftp_host"], ftp_port)
             ftp.login(config["ftp_user"], config["ftp_pass"])
             ftp.set_pasv(True)
-            ftp.cwd(remote_dir)
+            remote_dir = FTPToolkit.resolve_remote_dir(ftp, remote_dir)
 
             names = []
             # 首选 MLSD：facts 里带 type，能可靠排除目录
@@ -572,6 +622,14 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         if not isinstance(config.get("page_size"), int) or config["page_size"] <= 0:
             config["page_size"] = 20
 
+        # FTP 端口：默认 21（标准 FTP 端口），某些服务器可能用非标准端口（如 20195）
+        # 兼容字符串端口号（从 JSON 或用户输入）
+        port_value = config.get("ftp_port")
+        if isinstance(port_value, str) and port_value.isdigit():
+            config["ftp_port"] = int(port_value)
+        elif not isinstance(port_value, int) or port_value <= 0:
+            config["ftp_port"] = 21
+
         # 数据源：http = 接口下载 zip（推荐，最快拿到最新）
         #        ftp  = 从 FTP 下载（可能滞后）
         #        local = 直接用本地已有的
@@ -707,12 +765,13 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         print("\n" + "=" * 70)
         print("新建 FTP 配置".center(70))
         print("=" * 70)
-        print("\n请把 FTP 信息整块粘贴进来（4 行），格式如下：")
+        print("\n请把 FTP 信息整块粘贴进来（5 行），格式如下：")
         print("-" * 70)
-        print("FTP地址:222.171.249.195")
+        print("FTP地址:vpn.zihai.cn")
+        print("FTP端口:20195")
+        print("FTP账户:p8GX5Po3")
+        print("FTP密码:FDNmNDy8bQ@aA3")
         print("FTP非根目录:")
-        print("FTP账户:hrbls_org")
-        print("FTP密码:X7FEzMhJbSPh4jZJ")
         print("-" * 70)
         print("粘贴后按回车；若某行漏了，输入空行结束录入。\n")
 
@@ -740,16 +799,30 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         if not parsed["ftp_pass"]:
             parsed["ftp_pass"] = input("FTP 密码: ").strip()
 
+        # 端口补问（默认 21）
+        # 兼容整行粘贴，如「FTP端口:20195」「端口 20195」，只取其中的数字
+        if parsed["ftp_port"] == 21:
+            port_input = input(f"FTP 端口 (默认 {parsed['ftp_port']}): ").strip()
+            if port_input:
+                digits = re.findall(r"\d+", port_input)
+                port_num = int(digits[-1]) if digits else 0
+                if 1 <= port_num <= 65535:
+                    parsed["ftp_port"] = port_num
+                else:
+                    print(f"⚠️  端口无效，使用默认值 {parsed['ftp_port']}")
+
         config = {
             "ftp_host": parsed["ftp_host"],
             "ftp_user": parsed["ftp_user"],
             "ftp_pass": parsed["ftp_pass"],
+            "ftp_port": parsed["ftp_port"],
             # 远程 jsonDatas 固定在根目录，无需每次填写
             "ftp_upload_path": "/jsonDatas",
         }
 
         print("\n解析结果：")
         print(f"  FTP 地址: {config['ftp_host']}")
+        print(f"  FTP 端口: {config['ftp_port']}")
         print(f"  FTP 账户: {config['ftp_user']}")
         print(f"  FTP 密码: {config['ftp_pass']}")
         print(f"  上传目录: {config['ftp_upload_path']} (固定)")
@@ -763,9 +836,38 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         chosen = self.choose_paginate_files(config)
         config["paginate_files"] = chosen or ["content.json"]
 
+        # 数据源模式选择
+        print("\n" + "=" * 70)
+        print("数据源模式".center(70))
+        print("=" * 70)
+        print("  1. HTTP 接口下载 (推荐，最快获取最新数据)")
+        print("  2. FTP 下载 (可能有延迟)")
+        print("  3. 使用本地文件 (不下载)")
+        mode_choice = input("\n请选择 (1-3，默认 1): ").strip()
+
+        if mode_choice == "2":
+            config["source_mode"] = "ftp"
+        elif mode_choice == "3":
+            config["source_mode"] = "local"
+        else:  # 默认或选 1
+            config["source_mode"] = "http"
+            # HTTP 模式需要 site_id
+            print("\n接口地址: https://jzt2.china9.cn/api/Download/index")
+            site_id = input("请输入 site_id (例如: 654c9fc7f50ee1032170e5a1): ").strip()
+            config["site_id"] = site_id
+            config["api_base_url"] = DEFAULT_API_BASE_URL
+
+        # 是否上传
+        upload_choice = input("\n分页完成后是否上传到 FTP？(Y/n): ").strip().lower()
+        config["upload_after_paginate"] = upload_choice not in ("n", "no", "否")
+
         config_name = input("\n配置名称 (用于保存): ").strip()
         if config_name and self.save_config(config_name, config):
             print(f"✅ 配置已保存: {config_name}")
+            print(f"   数据源: {config['source_mode']}")
+            if config['source_mode'] == 'http':
+                print(f"   site_id: {config.get('site_id', '(未设置)')}")
+            print(f"   分页后上传: {'是' if config['upload_after_paginate'] else '否'}")
             return config_name
         return None
 
@@ -780,14 +882,16 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         print(f"FTP 诊断 - {config_name}".center(70))
         print("=" * 70 + "\n")
 
-        print(f"FTP 主机: {config['ftp_host']}")
+        ftp_port = config.get("ftp_port", 21)
+        print(f"FTP 主机: {config['ftp_host']}:{ftp_port}")
         print(f"账户: {config['ftp_user']}")
         print("-" * 70)
 
         # 测试 TCP
         print("\n[1/5] TCP 连接...")
         try:
-            ftp = FTP(config["ftp_host"], timeout=30)
+            ftp = FTP(timeout=30)
+            ftp.connect(config["ftp_host"], ftp_port)
             print("✅ TCP 连接成功")
         except Exception as e:
             print(f"❌ TCP 连接失败: {e}")
@@ -813,16 +917,16 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
 
         # 测试目录
         print(f"[4/5] 目录访问 ({config['ftp_upload_path']})...")
+        upload_base = config["ftp_upload_path"].rstrip("/")
         try:
-            ftp.cwd(config["ftp_upload_path"])
+            upload_base = FTPToolkit.resolve_remote_dir(ftp, upload_base)
             files = ftp.nlst()
-            print(f"✅ 目录访问成功，包含 {len(files)} 个项目")
+            print(f"✅ 目录访问成功（实际路径 {upload_base}），包含 {len(files)} 个项目")
         except Exception as e:
             print(f"⚠️  目录访问失败: {e}")
 
         # 测试源文件
         files = config.get("paginate_files") or ["content.json"]
-        upload_base = config["ftp_upload_path"].rstrip("/")
         print(f"[5/5] 检查源文件 ({len(files)} 个)...")
         for filename in files:
             remote = f"{upload_base}/{filename}"
@@ -857,7 +961,9 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
 
             # 自动测试
             try:
-                ftp = FTP(config["ftp_host"], timeout=30)
+                ftp_port = config.get("ftp_port", 21)
+                ftp = FTP(timeout=30)
+                ftp.connect(config["ftp_host"], ftp_port)
                 ftp.login(config["ftp_user"], config["ftp_pass"])
                 ftp.quit()
                 print("✅ 连接测试成功！")
@@ -891,6 +997,7 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
             "upload_after_paginate": "分页后上传",
             "site_id": "接口 site_id",
             "api_base_url": "接口地址",
+            "ftp_port": "FTP 端口",
         }
         readable = {
             "source_mode": {"http": "接口下载", "ftp": "FTP 下载", "local": "本地文件"},
@@ -972,7 +1079,22 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
             changed = changed or config.get("upload_after_paginate") is not False
             config["upload_after_paginate"] = False
 
-        if not changed:
+        # FTP 端口编辑（FTP/本地模式需要 FTP 连接）
+        print("\n编辑 FTP 连接选项?")
+        print(f"  当前 FTP 端口: {config.get('ftp_port', 21)}")
+        if input("  是否修改？(y/N): ").strip().lower() in ("y", "yes", "是"):
+            port_input = input(f"  请输入新端口 (1-65535，回车保持): ").strip()
+            if port_input:
+                # 兼容整行粘贴，如「FTP端口:20195」，只取其中的数字
+                digits = re.findall(r"\d+", port_input)
+                port_num = int(digits[-1]) if digits else 0
+                if 1 <= port_num <= 65535:
+                    if config.get("ftp_port") != port_num:
+                        config["ftp_port"] = port_num
+                        changed = True
+                else:
+                    print(f"  ⚠️  端口无效，保持原值")
+
             print("\n未做修改")
             return
 
@@ -1004,7 +1126,7 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
         print(f"\n运行流程: {self.describe_flow(config)}")
         print(f"当前分页文件 ({len(current)} 个): {', '.join(current)}")
 
-        answer = input("\n回车开始，c 改分页文件，m 改运行模式: ").strip().lower()
+        answer = input("\n回车开始，c 改分页文件，m 改运行模式，s 快速切换数据源: ").strip().lower()
 
         if answer == "c":
             chosen = self.choose_paginate_files(config, current)
@@ -1017,6 +1139,30 @@ $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
             # 模式已落盘，重新读取以应用新设置
             config = self.load_config(config_name) or config
             print(f"\n即将执行: {self.describe_flow(config)}")
+            input("按回车开始...")
+        elif answer == "s":
+            # 快速切换数据源（仅本次运行，不保存）
+            print("\n临时切换数据源（仅本次生效，不保存到配置）：")
+            print(f"  当前: {config.get('source_mode', 'ftp')}")
+            print("  1. HTTP 接口下载（推荐）")
+            print("  2. FTP 下载")
+            print("  3. 本地文件")
+            switch = input("选择 (1-3): ").strip()
+
+            if switch == "1":
+                config["source_mode"] = "http"
+                if not config.get("site_id"):
+                    site_id = input("请输入 site_id: ").strip()
+                    if site_id:
+                        config["site_id"] = site_id
+            elif switch == "2":
+                config["source_mode"] = "ftp"
+            elif switch == "3":
+                config["source_mode"] = "local"
+
+            print(f"\n✅ 本次将使用: {config['source_mode']}")
+            if config['source_mode'] == 'http' and config.get('site_id'):
+                print(f"   site_id: {config['site_id']}")
             input("按回车开始...")
 
         sync = FTPSync(config, toolkit=self, config_name=config_name)
@@ -1171,19 +1317,51 @@ class FTPSync:
         self.ftp = None
         self.toolkit = toolkit
         self.config_name = config_name
+        # 登录后按服务器实际家目录校正，run() 里统一用这个值拼远程路径
+        self.upload_base = (config.get("ftp_upload_path") or "/jsonDatas").rstrip("/")
 
     def connect_ftp(self):
         """连接到 FTP 服务器"""
         try:
-            print(f"\n[FTP] 连接到 {self.config['ftp_host']}...")
-            self.ftp = FTP(self.config["ftp_host"], timeout=30)
+            ftp_port = self.config.get("ftp_port", 21)
+            print(f"\n[FTP] 连接到 {self.config['ftp_host']}:{ftp_port}...")
+            self.ftp = FTP(timeout=30)
+            self.ftp.connect(self.config["ftp_host"], ftp_port)
             self.ftp.login(self.config["ftp_user"], self.config["ftp_pass"])
             self.ftp.set_pasv(True)
             print(f"[FTP] 认证成功")
+
+            # 校正上传目录：有的账户登录后落在自己的家目录而非根目录，
+            # 此时配置里的 /jsonDatas 在根下并不存在，需要拼上家目录前缀。
+            try:
+                self.upload_base = FTPToolkit.resolve_remote_dir(
+                    self.ftp, self.config.get("ftp_upload_path")
+                )
+            except Exception as e:
+                print(f"[错误] 远程目录不可用: {e}")
+                return False
+
             return True
         except Exception as e:
             print(f"[错误] FTP 连接失败: {e}")
             return False
+
+    def _ensure_remote_dir(self, remote_dir):
+        """递归创建 FTP 远程目录"""
+        if remote_dir in ("/", ""):
+            return
+        parts = remote_dir.strip("/").split("/")
+        current = ""
+        for part in parts:
+            current += "/" + part
+            try:
+                self.ftp.cwd(current)
+            except:
+                try:
+                    self.ftp.mkd(current)
+                    print(f"[FTP] 创建目录: {current}")
+                except:
+                    pass  # 目录可能已存在
 
     def download_file(self, remote_path, local_path):
         """从 FTP 下载文件"""
@@ -1200,11 +1378,25 @@ class FTPSync:
             return False
 
     def upload_file(self, local_path, remote_path):
-        """上传文件到 FTP"""
+        """上传文件到 FTP（智能处理绝对路径）"""
         try:
             print(f"[上传] {remote_path}...")
-            with open(local_path, "rb") as f:
-                self.ftp.storbinary(f"STOR {remote_path}", f)
+            # 如果是绝对路径（如 /jsonDatas/xxx.json），先切到目录再用文件名上传
+            if remote_path.startswith("/"):
+                remote_dir = remote_path.rsplit("/", 1)[0] or "/"
+                remote_filename = remote_path.rsplit("/", 1)[1]
+                try:
+                    self.ftp.cwd(remote_dir)
+                except:
+                    # 目录不存在时尝试创建
+                    self._ensure_remote_dir(remote_dir)
+                    self.ftp.cwd(remote_dir)
+                with open(local_path, "rb") as f:
+                    self.ftp.storbinary(f"STOR {remote_filename}", f)
+            else:
+                # 相对路径直接上传
+                with open(local_path, "rb") as f:
+                    self.ftp.storbinary(f"STOR {remote_path}", f)
             print(f"[上传] 完成")
             return True
         except Exception as e:
@@ -1212,14 +1404,22 @@ class FTPSync:
             return False
 
     def upload_tree(self, local_dir, remote_base):
-        """递归上传目录树到 FTP"""
+        """递归上传目录树到 FTP（智能处理绝对路径）"""
         try:
+            # 确保远程基础目录存在
+            if remote_base.startswith("/"):
+                self._ensure_remote_dir(remote_base)
+
             for root, dirs, files in os.walk(local_dir):
                 rel_path = os.path.relpath(root, local_dir)
                 if rel_path == ".":
                     remote_dir = remote_base
                 else:
                     remote_dir = remote_base + "/" + rel_path.replace("\\", "/")
+
+                # 确保当前远程目录存在
+                if remote_dir.startswith("/"):
+                    self._ensure_remote_dir(remote_dir)
 
                 for file in files:
                     local_file = os.path.join(root, file)
@@ -1325,7 +1525,6 @@ class FTPSync:
         http 源一次性拉 ZIP 到内存，循环里逐个文件提取。
         """
         files = self.config.get("paginate_files") or ["content.json"]
-        upload_base = self.config["ftp_upload_path"].rstrip("/")
         local_base = self.config["local_base_dir"]
         source_mode = self.config.get("source_mode", "ftp")
         do_upload = self.config.get("upload_after_paginate", True)
@@ -1359,6 +1558,9 @@ class FTPSync:
         # 只有真正需要时才连 FTP（上传或 FTP 源）
         if (from_ftp or do_upload) and not self.connect_ftp():
             return False
+
+        # connect_ftp() 里已按服务器家目录校正过，此后一律用这个基准路径
+        upload_base = self.upload_base.rstrip("/")
 
         succeeded, failed = [], []
 

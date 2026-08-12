@@ -1,0 +1,9 @@
+{
+  "ftp_host": "39.106.18.154",
+  "ftp_user": "hljge_com_cn",
+  "ftp_pass": "ZXEa2Nnm5P7ifNEJ",
+  "ftp_source_path": "/jsonDatas/content.json",
+  "ftp_upload_path": "/jsonDatas",
+  "local_base_dir": "E:\\项目\\建站通\\网站例子\\jsonDatas",
+  "page_size": 20
+}
